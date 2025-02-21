@@ -1,0 +1,157 @@
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import MinMaxScaler
+from alpaca.data import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+import numpy as np
+import time
+from datetime import datetime, timezone
+import os
+
+# Setup with Vercel environment variables
+API_KEY = os.environ.get('API_KEY')
+API_SECRET = os.environ.get('API_SECRET')
+SYMBOL = "TSLA"
+QTY = 42  # ~42 trades/min—max free tier
+
+data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
+
+def calculate_rsi(data, periods=7):
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# Pre-train
+print("Fetching 1 year of historical TSLA 1-min data from Alpaca...")
+df_all = pd.DataFrame()
+start_date = pd.Timestamp("2024-02-24", tz="UTC")
+end_date = pd.Timestamp("2025-02-23 23:59:59", tz="UTC")
+chunk_size = 20000
+
+while start_date < end_date:
+    request = StockBarsRequest(symbol_or_symbols=SYMBOL, timeframe=TimeFrame.Minute, start=start_date, end=end_date, limit=chunk_size)
+    try:
+        bars = data_client.get_stock_bars(request).df
+        if bars.empty:
+            break
+        df_all = pd.concat([df_all, bars])
+        start_date = bars.index.get_level_values(1)[-1] + pd.Timedelta(minutes=1)
+        print(f"Fetched {len(bars)} bars up to {bars.index.get_level_values(1)[-1]}")
+    except Exception as e:
+        print(f"Error fetching data: {e} - Check API keys or connectivity.")
+        raise
+    time.sleep(1)
+
+df_all = df_all.reset_index(level=0, drop=True)
+df_all.index = df_all.index.tz_convert("America/New_York")
+df_all = df_all.between_time("09:30", "16:00")
+
+data = df_all.rename(columns={"close": "Close", "volume": "Volume"})
+df = pd.DataFrame({"close": data["Close"]})
+df["prev_close"] = df["close"].shift(1)
+df["volume"] = data["Volume"]
+df["ma5"] = df["close"].rolling(window=5).mean()
+df["volatility"] = df["close"].rolling(window=5).std()
+df["rsi"] = calculate_rsi(df["close"], periods=7)
+df["target"] = (df["close"] > df["prev_close"]).astype(int)
+df.dropna(inplace=True)
+
+X = df[["prev_close", "volume", "ma5", "volatility", "rsi"]]
+y = df["target"]
+
+scaler = MinMaxScaler()
+X_np = scaler.fit_transform(X)
+y_np = y.to_numpy()
+
+model = LogisticRegression(random_state=42, max_iter=1000)
+start_time = time.time()
+model.fit(X_np, y_np)
+end_time = time.time()
+size_mb = sys.getsizeof(pickle.dumps(model)) / (1024 * 1024)
+print(f"LogisticRegression: Pre-trained in {end_time - start_time:.2f}s, Size = {size_mb:.4f} MB")
+print(f"Training data size: {len(df)} samples (~{len(df) / 390:.1f} days)")
+
+# Fully automated: Wait for market open, stop at close
+print("Waiting for market open...")
+MARKET_OPEN_CET = pd.Timestamp("2025-02-24 15:30:00", tz="Europe/Copenhagen")  # 3:30 PM CET
+MARKET_CLOSE_CET = pd.Timestamp("2025-02-24 22:00:00", tz="Europe/Copenhagen")  # 10:00 PM CET
+
+while datetime.now(timezone.utc) < MARKET_OPEN_CET.astimezone(timezone.utc):
+    print(f"{datetime.now(timezone.utc)}: Still waiting - Market opens at {MARKET_OPEN_CET}")
+    time.sleep(60)
+
+print(f"Starting live trading with Alpaca at {datetime.now()}")
+cash = 100000.0
+shares = 0
+trade_log = []
+
+while datetime.now(timezone.utc) < MARKET_CLOSE_CET.astimezone(timezone.utc):
+    try:
+        request = StockBarsRequest(symbol_or_symbols=SYMBOL, timeframe=TimeFrame.Minute, limit=8)
+        bars = data_client.get_stock_bars(request).df
+        if bars.empty:
+            print(f"{datetime.now()}: No bars fetched—market may be closed")
+            time.sleep(60)
+            continue
+
+        timestamps = bars.index.get_level_values(1).tz_convert("America/New_York")
+        latest_time = timestamps[-1].time()
+        if not (latest_time >= pd.Timestamp("09:30").time() and latest_time <= pd.Timestamp("16:00").time()):
+            print(f"{datetime.now()}: Outside trading hours ({latest_time})—waiting")
+            time.sleep(60)
+            continue
+
+        latest_bar = bars.iloc[-1]
+        latest_data = pd.DataFrame({
+            "close": [latest_bar["close"]],
+            "prev_close": [bars.iloc[-2]["close"]],
+            "volume": [latest_bar["volume"]],
+            "ma5": [bars["close"][-5:].mean()],
+            "volatility": [bars["close"][-5:].std()],
+            "rsi": [calculate_rsi(bars["close"])[-1]]
+        })
+        latest_np = scaler.transform(latest_data[["prev_close", "volume", "ma5", "volatility", "rsi"]])
+
+        prediction = model.predict(latest_np)[0]
+        signal = "BUY" if prediction == 1 else "SELL"
+        price = latest_bar["close"]
+        print(f"{datetime.now()}: Price = ${price:.2f}, Signal = {signal}, Shares = {shares}, Cash = ${cash:.2f}")
+
+        order = MarketOrderRequest(symbol=SYMBOL, qty=QTY, time_in_force=TimeInForce.GTC)
+        if signal == "BUY" and cash >= price * QTY:
+            order.side = OrderSide.BUY
+            trading_client.submit_order(order)
+            shares += QTY
+            cash -= price * QTY
+            trade_log.append(f"BUY: {QTY} shares at ${price:.2f}, {datetime.now()}")
+            print(f"BUY: {QTY} shares at ${price:.2f}, Shares = {shares}, Cash = ${cash:.2f}")
+        elif signal == "SELL" and shares >= QTY:
+            order.side = OrderSide.SELL
+            trading_client.submit_order(order)
+            shares -= QTY
+            cash += price * QTY
+            trade_log.append(f"SELL: {QTY} shares at ${price:.2f}, {datetime.now()}")
+            print(f"SELL: {QTY} shares at ${price:.2f}, Shares = {shares}, Cash = ${cash:.2f}")
+
+        total_value = cash + shares * price
+        print(f"Total Value = ${total_value:.2f} (+{((total_value - 100000) / 100000 * 100):.2f}%)")
+        time.sleep(60)  # 1 trade/min—adjusted to ~42 trades/min
+
+    except Exception as e:
+        print(f"Error during live trading: {e}")
+        time.sleep(60)
+
+print(f"{datetime.now()}: Market closed—stopping trading")
+with open("trade_log.txt", "w") as f:
+    f.write("\nTrade Log:\n")
+    for entry in trade_log:
+        f.write(f"{entry}\n")
+print("Trade log saved to 'trade_log.txt'")
